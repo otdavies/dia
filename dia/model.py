@@ -1,6 +1,5 @@
 import time
 from enum import Enum
-from typing import Optional
 
 import dac
 import numpy as np
@@ -35,23 +34,29 @@ def _sample_next_token(
 
     logits_BCxV = logits_BCxV / temperature
     if cfg_filter_top_k is not None:
-        _, top_k_indices_BCxV = torch.topk(logits_BCxV, k=cfg_filter_top_k, dim=-1)
+        _, top_k_indices_BCxV = torch.topk(
+            logits_BCxV, k=cfg_filter_top_k, dim=-1)
         mask = torch.ones_like(logits_BCxV, dtype=torch.bool)
         mask.scatter_(dim=-1, index=top_k_indices_BCxV, value=False)
         logits_BCxV = logits_BCxV.masked_fill(mask, -torch.inf)
 
     if top_p < 1.0:
         probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
-        sorted_probs_BCxV, sorted_indices_BCxV = torch.sort(probs_BCxV, dim=-1, descending=True)
+        sorted_probs_BCxV, sorted_indices_BCxV = torch.sort(
+            probs_BCxV, dim=-1, descending=True)
         cumulative_probs_BCxV = torch.cumsum(sorted_probs_BCxV, dim=-1)
 
         sorted_indices_to_remove_BCxV = cumulative_probs_BCxV > top_p
-        sorted_indices_to_remove_BCxV[..., 1:] = sorted_indices_to_remove_BCxV[..., :-1].clone()
+        sorted_indices_to_remove_BCxV[...,
+                                      1:] = sorted_indices_to_remove_BCxV[..., :-1].clone()
         sorted_indices_to_remove_BCxV[..., 0] = 0
 
-        indices_to_remove_BCxV = torch.zeros_like(sorted_indices_to_remove_BCxV)
-        indices_to_remove_BCxV.scatter_(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
-        logits_BCxV = logits_BCxV.masked_fill(indices_to_remove_BCxV, -torch.inf)
+        indices_to_remove_BCxV = torch.zeros_like(
+            sorted_indices_to_remove_BCxV)
+        indices_to_remove_BCxV.scatter_(
+            dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
+        logits_BCxV = logits_BCxV.masked_fill(
+            indices_to_remove_BCxV, -torch.inf)
 
     final_probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
 
@@ -133,9 +138,11 @@ class Dia:
             state_dict = torch.load(checkpoint_path, map_location=dia.device)
             dia.model.load_state_dict(state_dict)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
+            raise FileNotFoundError(
+                f"Checkpoint file not found at {checkpoint_path}")
         except Exception as e:
-            raise RuntimeError(f"Error loading checkpoint from {checkpoint_path}") from e
+            raise RuntimeError(
+                f"Error loading checkpoint from {checkpoint_path}") from e
 
         dia.model.to(dia.device)
         dia.model.eval()
@@ -168,7 +175,8 @@ class Dia:
         """
         if isinstance(compute_dtype, str):
             compute_dtype = ComputeDtype(compute_dtype)
-        loaded_model = DiaModel.from_pretrained(model_name, compute_dtype=compute_dtype.to_dtype())
+        loaded_model = DiaModel.from_pretrained(
+            model_name, compute_dtype=compute_dtype.to_dtype())
         config = loaded_model.config
         dia = cls(config, compute_dtype, device)
 
@@ -192,7 +200,8 @@ class Dia:
         max_len = self.config.data.text_length
 
         byte_text = text.encode("utf-8")
-        replaced_bytes = byte_text.replace(b"[S1]", b"\x01").replace(b"[S2]", b"\x02")
+        replaced_bytes = byte_text.replace(
+            b"[S1]", b"\x01").replace(b"[S2]", b"\x02")
         text_tokens = list(replaced_bytes)
 
         current_len = len(text_tokens)
@@ -208,7 +217,8 @@ class Dia:
                 constant_values=text_pad_value,
             ).astype(np.uint8)
 
-        src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)  # [1, S]
+        src_tokens = torch.from_numpy(padded_text_np).to(
+            torch.long).to(self.device).unsqueeze(0)  # [1, S]
         return src_tokens
 
     def _prepare_audio_prompt(self, audio_prompt: torch.Tensor | None) -> tuple[torch.Tensor, int]:
@@ -267,7 +277,8 @@ class Dia:
         enc_state = EncoderInferenceState.new(self.config, enc_input_cond)
         encoder_out = self.model.encoder(enc_input, enc_state)
 
-        dec_cross_attn_cache = self.model.decoder.precompute_cross_attn_cache(encoder_out, enc_state.positions)
+        dec_cross_attn_cache = self.model.decoder.precompute_cross_attn_cache(
+            encoder_out, enc_state.positions)
         dec_state = DecoderInferenceState.new(
             self.config, enc_state, encoder_out, dec_cross_attn_cache, self.compute_dtype
         )
@@ -277,7 +288,8 @@ class Dia:
         dec_step = prefill_step - 1
         if dec_step > 0:
             dec_state.prepare_step(0, dec_step)
-            tokens_BxTxC = dec_output.get_tokens_at(0, dec_step).unsqueeze(0).expand(2, -1, -1)
+            tokens_BxTxC = dec_output.get_tokens_at(
+                0, dec_step).unsqueeze(0).expand(2, -1, -1)
             self.model.decoder.forward(tokens_BxTxC, dec_state)
 
         return dec_state, dec_output
@@ -292,14 +304,16 @@ class Dia:
         cfg_filter_top_k: int,
     ) -> torch.Tensor:
         audio_eos_value = self.config.data.audio_eos_value
-        logits_Bx1xCxV = self.model.decoder.decode_step(tokens_Bx1xC, dec_state)
+        logits_Bx1xCxV = self.model.decoder.decode_step(
+            tokens_Bx1xC, dec_state)
 
         logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]
         uncond_logits_CxV = logits_last_BxCxV[0, :, :]
         cond_logits_CxV = logits_last_BxCxV[1, :, :]
 
-        logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
-        logits_CxV[:, audio_eos_value + 1 :] = -torch.inf
+        logits_CxV = cond_logits_CxV + cfg_scale * \
+            (cond_logits_CxV - uncond_logits_CxV)
+        logits_CxV[:, audio_eos_value + 1:] = -torch.inf
         logits_CxV[1:, audio_eos_value:] = -torch.inf
 
         pred_C = _sample_next_token(
@@ -333,7 +347,8 @@ class Dia:
 
         min_valid_index = 0
         max_valid_index = 1023
-        invalid_mask = (codebook < min_valid_index) | (codebook > max_valid_index)
+        invalid_mask = (codebook < min_valid_index) | (
+            codebook > max_valid_index)
         codebook[invalid_mask] = 0
 
         audio = decode(self.dac_model, codebook.transpose(1, 2))
@@ -343,10 +358,12 @@ class Dia:
     def load_audio(self, audio_path: str) -> torch.Tensor:
         audio, sr = torchaudio.load(audio_path, channels_first=True)  # C, T
         if sr != DEFAULT_SAMPLE_RATE:
-            audio = torchaudio.functional.resample(audio, sr, DEFAULT_SAMPLE_RATE)
+            audio = torchaudio.functional.resample(
+                audio, sr, DEFAULT_SAMPLE_RATE)
         audio = audio.to(self.device).unsqueeze(0)  # 1, C, T
         audio_data = self.dac_model.preprocess(audio, DEFAULT_SAMPLE_RATE)
-        _, encoded_frame, _, _, _ = self.dac_model.encode(audio_data)  # 1, C, T
+        _, encoded_frame, _, _, _ = self.dac_model.encode(
+            audio_data)  # 1, C, T
         return encoded_frame.squeeze(0).transpose(0, 1)
 
     def save_audio(self, path: str, audio: np.ndarray):
@@ -366,10 +383,12 @@ class Dia:
         cfg_filter_top_k: int = 35,
         audio_prompt: str | torch.Tensor | None = None,
         audio_prompt_path: str | None = None,
-        audio_prompt_text: Optional[str] = None,
+        audio_prompt_text: str = None,
         use_cfg_filter: bool | None = None,
         verbose: bool = False,
+        use_offloading: bool = True,  # New parameter to control offloading
     ) -> np.ndarray:
+        """Generate audio from text with optimized memory usage through selective offloading."""
         audio_eos_value = self.config.data.audio_eos_value
         audio_pad_value = self.config.data.audio_pad_value
         delay_pattern = self.config.data.delay_pattern
@@ -390,8 +409,25 @@ class Dia:
         if verbose:
             total_start_time = time.time()
 
-        dec_state, dec_output = self._prepare_generation(full_text, audio_prompt, verbose)
+        # Prepare text and audio prompt
+        dec_state, dec_output = self._prepare_generation(
+            full_text, audio_prompt, verbose)
         dec_step = dec_output.prefill_step - 1
+
+        # After encoder processing, offload encoder to CPU to free GPU memory
+        original_device = None
+        if use_offloading:
+            # Get the device from one of the encoder's parameters
+            for param in self.model.encoder.parameters():
+                original_device = param.device
+                break
+
+            if original_device is not None and original_device.type != 'cpu':
+                if verbose:
+                    print(
+                        f"Offloading encoder from {original_device} to CPU to free GPU memory")
+                self.model.encoder = self.model.encoder.to('cpu')
+                torch.cuda.empty_cache()
 
         bos_countdown = max_delay_pattern
         eos_detected = False
@@ -405,57 +441,68 @@ class Dia:
         if verbose:
             print("generate: starting generation loop")
             if use_torch_compile:
-                print("generate: by using use_torch_compile=True, the first step would take long")
+                print(
+                    "generate: by using use_torch_compile=True, the first step would take long")
             start_time = time.time()
 
-        while dec_step < max_tokens:
-            dec_state.prepare_step(dec_step)
-            tokens_Bx1xC = dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
-            pred_C = step_fn(
-                tokens_Bx1xC,
-                dec_state,
-                cfg_scale,
-                temperature,
-                top_p,
-                cfg_filter_top_k,
-            )
-
-            if (not eos_detected and pred_C[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
-                eos_detected = True
-                eos_countdown = max_delay_pattern
-
-            if eos_countdown > 0:
-                step_after_eos = max_delay_pattern - eos_countdown
-                for i, d in enumerate(delay_pattern):
-                    if step_after_eos == d:
-                        pred_C[i] = audio_eos_value
-                    elif step_after_eos > d:
-                        pred_C[i] = audio_pad_value
-                eos_countdown -= 1
-
-            bos_countdown = max(0, bos_countdown - 1)
-            dec_output.update_one(pred_C, dec_step + 1, bos_countdown > 0)
-
-            if eos_countdown == 0:
-                break
-
-            dec_step += 1
-            if verbose and dec_step % 86 == 0:
-                duration = time.time() - start_time
-                print(
-                    f"generate step {dec_step}: speed={86 / duration:.3f} tokens/s, realtime factor={1 / duration:.3f}x"
+        try:
+            while dec_step < max_tokens:
+                dec_state.prepare_step(dec_step)
+                tokens_Bx1xC = dec_output.get_tokens_at(
+                    dec_step).unsqueeze(0).expand(2, -1, -1)
+                pred_C = step_fn(
+                    tokens_Bx1xC,
+                    dec_state,
+                    cfg_scale,
+                    temperature,
+                    top_p,
+                    cfg_filter_top_k,
                 )
-                start_time = time.time()
 
-        if dec_output.prefill_step >= dec_step + 1:
-            print("Warning: Nothing generated")
-            return None
+                if (not eos_detected and pred_C[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
+                    eos_detected = True
+                    eos_countdown = max_delay_pattern
 
-        generated_codes = dec_output.generated_tokens[dec_output.prefill_step : dec_step + 1, :]
+                if eos_countdown > 0:
+                    step_after_eos = max_delay_pattern - eos_countdown
+                    for i, d in enumerate(delay_pattern):
+                        if step_after_eos == d:
+                            pred_C[i] = audio_eos_value
+                        elif step_after_eos > d:
+                            pred_C[i] = audio_pad_value
+                    eos_countdown -= 1
 
-        if verbose:
-            total_step = dec_step + 1 - dec_output.prefill_step
-            total_duration = time.time() - total_start_time
-            print(f"generate: total step={total_step}, total duration={total_duration:.3f}s")
+                bos_countdown = max(0, bos_countdown - 1)
+                dec_output.update_one(pred_C, dec_step + 1, bos_countdown > 0)
 
-        return self._generate_output(generated_codes)
+                if eos_countdown == 0:
+                    break
+
+                dec_step += 1
+                if verbose and dec_step % 86 == 0:
+                    duration = time.time() - start_time
+                    print(
+                        f"generate step {dec_step}: speed={86 / duration:.3f} tokens/s, realtime factor={1 / duration:.3f}x"
+                    )
+                    start_time = time.time()
+
+            if dec_output.prefill_step >= dec_step + 1:
+                print("Warning: Nothing generated")
+                return None
+
+            generated_codes = dec_output.generated_tokens[dec_output.prefill_step: dec_step + 1, :]
+
+            if verbose:
+                total_step = dec_step + 1 - dec_output.prefill_step
+                total_duration = time.time() - total_start_time
+                print(
+                    f"generate: total step={total_step}, total duration={total_duration:.3f}s")
+
+            return self._generate_output(generated_codes)
+
+        finally:
+            # Always move encoder back in the finally block to ensure it happens
+            if use_offloading and original_device is not None and original_device.type != 'cpu':
+                if verbose:
+                    print(f"Moving encoder back to {original_device}")
+                self.model.encoder = self.model.encoder.to(original_device)

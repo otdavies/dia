@@ -5,8 +5,9 @@ import time
 import random
 import io
 import contextlib
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import gradio as gr
 import numpy as np
@@ -18,8 +19,10 @@ from dia.model import Dia
 
 # --- Global Setup ---
 parser = argparse.ArgumentParser(description="Gradio interface for Nari TTS")
-parser.add_argument("--device", type=str, default=None, help="Force device (e.g., 'cuda', 'mps', 'cpu')")
-parser.add_argument("--share", action="store_true", help="Enable Gradio sharing")
+parser.add_argument("--device", type=str, default=None,
+                    help="Force device (e.g., 'cuda', 'mps', 'cpu')")
+parser.add_argument("--share", action="store_true",
+                    help="Enable Gradio sharing")
 
 args = parser.parse_args()
 
@@ -41,30 +44,49 @@ print(f"Using device: {device}")
 # Load Nari model and config
 print("Loading Nari model...")
 try:
-    # Step 1: Load model normally
-    model = Dia.from_pretrained(
-        "nari-labs/Dia-1.6B",
-        compute_dtype="float16",
-        device=device
-    )
+    # Load model with enhanced 8-bit quantization for better performance
+    def load_optimized_model(device, verbose=True):
+        if verbose:
+            print("Loading Dia model with optimizations...")
 
-    # Step 2: Apply dynamic quantization
-    quantized_model = torch.quantization.quantize_dynamic(
-        model.model,
-        {torch.nn.Linear, torch.nn.LSTM},
-        dtype=torch.qint8
-    )
+        try:
+            # Step 1: Load model normally
+            model = Dia.from_pretrained(
+                "nari-labs/Dia-1.6B",
+                compute_dtype="float16",
+                device=device
+            )
 
-    # Step 3: Dereference the original
-    model.model = None
-    torch.cuda.empty_cache()
+            # Step 2: Apply dynamic quantization with expanded coverage
+            quantized_model = torch.quantization.quantize_dynamic(
+                model.model,
+                {torch.nn.Linear, torch.nn.LSTM},
+                dtype=torch.qint8
+            )
 
-    # Step 4: Replace with quantized
-    model.model = quantized_model
+            # Step 3: Dereference the original
+            model.model = None
+            torch.cuda.empty_cache()
+
+            # Step 4: Replace with quantized
+            model.model = quantized_model
+
+            if verbose:
+                print("Model loaded with optimized quantization")
+
+            return model
+
+        except Exception as e:
+            print(f"Error loading Dia model: {e}")
+            raise
+
+    # Load the model
+    model = load_optimized_model(device)
 
 except Exception as e:
     print(f"Error loading Nari model: {e}")
     raise
+
 
 def set_seed(seed: int):
     """Sets the random seed for reproducibility."""
@@ -77,24 +99,60 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def count_effective_length(text):
     """Counts effective length treating [S1] and [S2] as single characters."""
     return len(text.replace("[S1]", "¤").replace("[S2]", "¤"))
 
-def auto_adjust_chunk_size(text, user_chunk_size):
-    """Auto-adjusts chunk size if turbo mode is enabled."""
-    effective_chars = count_effective_length(text)
-    if user_chunk_size > 0:
-        # If user explicitly sets a chunk size, respect it
-        return int(user_chunk_size)
-    else:
-        # Auto-tune based on input size
-        if effective_chars <= 1024:
-            return 48
-        elif effective_chars <= 4096:
-            return 64
+
+def improved_text_chunking(text, max_effective_chars=64):
+    """
+    Splits text into chunks by sentence boundaries while respecting special
+    tokens and max size constraints. Improves quality by not cutting mid-sentence.
+    """
+    # Protect special tokens from splitting
+    protected_text = text.replace("[S1]", " [S1] ")
+    protected_text = protected_text.replace("[S2]", " [S2] ")
+
+    # Split on sentence boundaries (., !, ?)
+    sentence_pattern = r'(?<=[.!?])\s+'
+    sentences = re.split(sentence_pattern, protected_text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        # If single sentence exceeds max chars, resort to word splitting
+        if count_effective_length(sentence) > max_effective_chars:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+
+            # Fall back to word splitting for this long sentence
+            word_chunks = split_by_words_respecting_special_tokens(
+                sentence, max_effective_chars)
+            chunks.extend(word_chunks)
+            continue
+
+        # Try adding this sentence to current chunk
+        tentative_chunk = (current_chunk + " " +
+                           sentence).strip() if current_chunk else sentence
+
+        if count_effective_length(tentative_chunk) > max_effective_chars:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
         else:
-            return 96
+            current_chunk = tentative_chunk
+
+    # Don't forget the last chunk
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    # Ensure we don't have empty chunks
+    chunks = [c for c in chunks if count_effective_length(c) > 0]
+
+    return chunks
 
 
 def split_by_words_respecting_special_tokens(text, max_effective_chars=64):
@@ -104,7 +162,8 @@ def split_by_words_respecting_special_tokens(text, max_effective_chars=64):
     current_chunk = ""
 
     for word in words:
-        tentative_chunk = (current_chunk + " " + word).strip() if current_chunk else word
+        tentative_chunk = (current_chunk + " " +
+                           word).strip() if current_chunk else word
         if count_effective_length(tentative_chunk) > max_effective_chars:
             if current_chunk:
                 chunks.append(current_chunk.strip())
@@ -120,24 +179,54 @@ def split_by_words_respecting_special_tokens(text, max_effective_chars=64):
 
     return chunks
 
-def batch_chunks(chunks, batch_size):
-    """Yield successive batches of chunks."""
-    for i in range(0, len(chunks), batch_size):
-        yield chunks[i:i + batch_size]
 
-def split_lines_greedy(lines, chunk_size):
-    """Greedily split lines into chunks of up to chunk_size lines."""
-    chunks = []
-    i = 0
-    while i < len(lines):
-        remaining = len(lines) - i
-        if remaining <= chunk_size:
-            chunks.append("\n".join(lines[i:]))
-            break
+def auto_adjust_chunk_size(text, user_chunk_size):
+    """Auto-adjusts chunk size for optimal balance between speed and quality."""
+    effective_chars = count_effective_length(text)
+    if user_chunk_size > 0:
+        # If user explicitly sets a chunk size, respect it
+        return int(user_chunk_size)
+    else:
+        # Auto-tune based on input size - larger chunks for longer text
+        if effective_chars <= 1024:
+            return 48
+        elif effective_chars <= 4096:
+            return 64  # Increased for better sentence grouping
         else:
-            chunks.append("\n".join(lines[i:i+chunk_size]))
-            i += chunk_size
-    return chunks
+            return 128  # Increased for better efficiency
+
+
+def optimized_batch_chunks(chunks, batch_size=4, max_tokens_per_batch=3072):
+    """
+    Create optimized batches that balance between batch size and token count.
+    This avoids processing very small or overly large batches.
+    """
+    # First, estimate token count per chunk (rough approximation)
+    # ~0.9 tokens per character
+    estimated_tokens = [len(chunk) * 0.9 for chunk in chunks]
+
+    current_batch = []
+    current_token_count = 0
+    batches = []
+
+    for i, (chunk, token_est) in enumerate(zip(chunks, estimated_tokens)):
+        # If adding this chunk would exceed token limit and we have chunks already,
+        # or if we've reached batch size, yield the current batch
+        if ((current_token_count + token_est > max_tokens_per_batch and current_batch) or
+                len(current_batch) >= batch_size):
+            batches.append(current_batch)
+            current_batch = [chunk]
+            current_token_count = token_est
+        else:
+            current_batch.append(chunk)
+            current_token_count += token_est
+
+    # Don't forget the last batch
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
 
 def run_inference(
     text_input: str,
@@ -185,50 +274,63 @@ def run_inference(
             if audio_prompt_input is not None:
                 sr, audio_data = audio_prompt_input
                 if audio_data is None or audio_data.size == 0 or audio_data.max() == 0:
-                    gr.Warning("Audio prompt seems empty or silent, ignoring prompt.")
+                    gr.Warning(
+                        "Audio prompt seems empty or silent, ignoring prompt.")
                 else:
                     with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_audio:
                         temp_audio_prompt_path = f_audio.name
 
                         if np.issubdtype(audio_data.dtype, np.integer):
                             max_val = np.iinfo(audio_data.dtype).max
-                            audio_data = audio_data.astype(np.float32) / max_val
+                            audio_data = audio_data.astype(
+                                np.float32) / max_val
                         elif not np.issubdtype(audio_data.dtype, np.floating):
                             try:
                                 audio_data = audio_data.astype(np.float32)
                             except Exception as conv_e:
-                                raise gr.Error(f"Failed to convert audio prompt: {conv_e}")
+                                raise gr.Error(
+                                    f"Failed to convert audio prompt: {conv_e}")
 
                         if audio_data.ndim > 1:
                             audio_data = np.mean(audio_data, axis=-1)
                             audio_data = np.ascontiguousarray(audio_data)
 
-                        sf.write(temp_audio_prompt_path, audio_data, sr, subtype="FLOAT")
+                        sf.write(temp_audio_prompt_path,
+                                 audio_data, sr, subtype="FLOAT")
                         prompt_path_for_generate = temp_audio_prompt_path
-                        print(f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})")
+                        print(
+                            f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})")
 
-            # --- Chunking ---
+            # --- Improved Chunking ---
             chunk_size = auto_adjust_chunk_size(text_input, chunk_size)
-            print(f"Auto-selected chunk size: {chunk_size} effective characters per chunk.")
-            # New: Split by effective character count (~64 chars per chunk)
-            chunks = split_by_words_respecting_special_tokens(text_input, max_effective_chars=chunk_size)
+            print(
+                f"Auto-selected chunk size: {chunk_size} effective characters per chunk.")
 
-            print(f"Chunked into {len(chunks)} chunks (based on effective character count).")
+            # Use improved sentence-aware chunking
+            chunks = improved_text_chunking(
+                text_input, max_effective_chars=chunk_size)
+
+            print(
+                f"Chunked into {len(chunks)} chunks (respecting sentence boundaries).")
 
             audio_segments = []
 
             start_time = time.time()
 
-            batch_size = 4  # Adjust based on your GPU VRAM (e.g., 2–8)
+            # Use optimized adaptive batching
+            batches = optimized_batch_chunks(
+                chunks, batch_size=8, max_tokens_per_batch=3072)
 
-            for batch_idx, chunk_batch in enumerate(batch_chunks(chunks, batch_size)):
+            for batch_idx, chunk_batch in enumerate(batches):
                 print(
-                    f"Generating batch {batch_idx + 1}/{(len(chunks) + batch_size - 1) // batch_size} with {len(chunk_batch)} chunks...")
+                    f"Generating batch {batch_idx + 1}/{len(batches)} with {len(chunk_batch)} chunks...")
 
-                batch_input_text = "\n".join(chunk.strip() for chunk in chunk_batch).strip()
+                batch_input_text = "\n".join(
+                    chunk.strip() for chunk in chunk_batch).strip()
 
                 if not batch_input_text:
-                    raise gr.Error("All chunks in this batch were empty after trimming. Cannot generate.")
+                    raise gr.Error(
+                        "All chunks in this batch were empty after trimming. Cannot generate.")
                 effective_chars = count_effective_length(batch_input_text)
                 scaling_factor = effective_chars / chunk_size
                 adjusted_tokens = int(max_new_tokens * scaling_factor)
@@ -242,20 +344,25 @@ def run_inference(
                         temperature=temperature,
                         top_p=top_p,
                         cfg_filter_top_k=cfg_filter_top_k,
-                        use_torch_compile=False,
+                        use_torch_compile=True,
                         audio_prompt=prompt_path_for_generate,
                         audio_prompt_text=audio_prompt_text_input,
+                        use_offloading=True,  # Enable selective offloading for memory efficiency
                     )
 
                 if generated_batch_audio is not None:
                     audio_segments.append(generated_batch_audio)
 
                     # Add a small silence buffer **after the batch** (but NOT after the last batch)
-                    if batch_idx < (len(chunks) + batch_size - 1) // batch_size - 1:
+                    if batch_idx < len(batches) - 1:
                         silence_duration_sec = 0.2
                         silence_samples = int(44100 * silence_duration_sec)
                         silence = np.zeros(silence_samples, dtype=np.float32)
                         audio_segments.append(silence)
+
+                # Force release memory after each batch
+                torch.cuda.empty_cache()
+                gc.collect()
 
             if not audio_segments:
                 output_audio_np = None
@@ -263,7 +370,8 @@ def run_inference(
                 output_audio_np = np.concatenate(audio_segments)
 
             end_time = time.time()
-            print(f"Generation finished in {end_time - start_time:.2f} seconds.\n")
+            print(
+                f"Generation finished in {end_time - start_time:.2f} seconds.\n")
 
             # --- Postprocessing ---
             if output_audio_np is not None:
@@ -277,17 +385,22 @@ def run_inference(
                 if target_len != original_len and target_len > 0:
                     x_original = np.arange(original_len)
                     x_resampled = np.linspace(0, original_len - 1, target_len)
-                    resampled_audio_np = np.interp(x_resampled, x_original, output_audio_np)
-                    output_audio = (output_sr, resampled_audio_np.astype(np.float32))
-                    print(f"Resampled audio from {original_len} to {target_len} samples for {speed_factor:.2f}x speed.")
+                    resampled_audio_np = np.interp(
+                        x_resampled, x_original, output_audio_np)
+                    output_audio = (
+                        output_sr, resampled_audio_np.astype(np.float32))
+                    print(
+                        f"Resampled audio from {original_len} to {target_len} samples for {speed_factor:.2f}x speed.")
                 else:
                     output_audio = (output_sr, output_audio_np)
-                    print(f"Skipping audio speed adjustment (factor: {speed_factor:.2f}).")
+                    print(
+                        f"Skipping audio speed adjustment (factor: {speed_factor:.2f}).")
 
                 # Final output conversion
                 if output_audio[1].dtype in (np.float32, np.float64):
                     audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
-                    audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
+                    audio_for_gradio = (
+                        audio_for_gradio * 32767).astype(np.int16)
                     output_audio = (output_sr, audio_for_gradio)
                     print("Converted audio to int16 for Gradio output.")
             else:
@@ -305,9 +418,11 @@ def run_inference(
             if temp_audio_prompt_path and Path(temp_audio_prompt_path).exists():
                 try:
                     Path(temp_audio_prompt_path).unlink()
-                    print(f"Deleted temporary audio prompt file: {temp_audio_prompt_path}")
+                    print(
+                        f"Deleted temporary audio prompt file: {temp_audio_prompt_path}")
                 except Exception as cleanup_e:
-                    print(f"Warning: Error deleting temporary audio prompt file: {cleanup_e}")
+                    print(
+                        f"Warning: Error deleting temporary audio prompt file: {cleanup_e}")
 
         console_output = console_output_buffer.getvalue()
 
@@ -355,13 +470,13 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
                     label="Transcript of Audio Prompt (Required if using Audio Prompt)",
                     placeholder="Enter text here...",
                     value="",
-                    lines=5,  # Increased lines
+                    lines=5,
                 )
             text_input = gr.Textbox(
                 label="Text To Generate",
                 placeholder="Enter text here...",
                 value=default_text,
-                lines=5,  # Increased lines
+                lines=5,
             )
             with gr.Accordion("Generation Parameters", open=False):
                 chunk_size = gr.Number(
@@ -376,7 +491,7 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
                     label="Max New Tokens (Audio Length)",
                     minimum=860,
                     maximum=3072,
-                    value=model.config.data.audio_length,  # Use config default if available, else fallback
+                    value=model.config.data.audio_length,
                     step=50,
                     info="Controls the maximum length of the generated audio (more tokens = longer audio).",
                 )
@@ -384,7 +499,7 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
                     label="CFG Scale (Guidance Strength)",
                     minimum=1.0,
                     maximum=5.0,
-                    value=3.0,  # Default from inference.py
+                    value=3.0,
                     step=0.1,
                     info="Higher values increase adherence to the text prompt.",
                 )
@@ -392,7 +507,7 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
                     label="Temperature (Randomness)",
                     minimum=1.0,
                     maximum=1.5,
-                    value=1.3,  # Default from inference.py
+                    value=1.3,
                     step=0.05,
                     info="Lower values make the output more deterministic, higher values increase randomness.",
                 )
@@ -400,7 +515,7 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
                     label="Top P (Nucleus Sampling)",
                     minimum=0.80,
                     maximum=1.0,
-                    value=0.95,  # Default from inference.py
+                    value=0.95,
                     step=0.01,
                     info="Filters vocabulary to the most likely tokens cumulatively reaching probability P.",
                 )
@@ -423,7 +538,7 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
                 seed_input = gr.Number(
                     label="Generation Seed (Optional)",
                     value=-1,
-                    precision=0,  # No decimal points
+                    precision=0,
                     step=1,
                     interactive=True,
                     info="Set a generation seed for reproducible outputs. Leave empty or -1 for random seed.",
@@ -465,61 +580,11 @@ with gr.Blocks(css=css, theme="gradio/dark") as demo:
             audio_output,
             seed_output,
             console_output,
-                 ],  # Add status_output here if using it
+        ],
         api_name="generate_audio",
     )
 
-    # Add examples (ensure the prompt path is correct or remove it if example file doesn't exist)
-    example_prompt_path = "./example_prompt.mp3"  # Adjust if needed
-    examples_list = [
-        [
-            "[S1] Oh fire! Oh my goodness! What's the procedure? What to we do people? The smoke could be coming through an air duct! \n[S2] Oh my god! Okay.. it's happening. Everybody stay calm! \n[S1] What's the procedure... \n[S2] Everybody stay fucking calm!!!... Everybody fucking calm down!!!!! \n[S1] No! No! If you touch the handle, if its hot there might be a fire down the hallway! ",
-            None,
-            3072,
-            3.0,
-            1.3,
-            0.95,
-            35,
-            0.94,
-            4,
-            -1,
-        ],
-        [
-            "[S1] Open weights text to dialogue model. \n[S2] You get full control over scripts and voices. \n[S1] I'm biased, but I think we clearly won. \n[S2] Hard to disagree. (laughs) \n[S1] Thanks for listening to this demo. \n[S2] Try it now on Git hub and Hugging Face. \n[S1] If you liked our model, please give us a star and share to your friends. \n[S2] This was Nari Labs.",
-            example_prompt_path if Path(example_prompt_path).exists() else None,
-            3072,
-            3.0,
-            1.3,
-            0.95,
-            35,
-            0.94,
-            4,
-            -1,
-        ],
-    ]
-
-    if examples_list:
-        gr.Examples(
-            examples=examples_list,
-            inputs=[
-                text_input,
-                audio_prompt_input,
-                max_new_tokens,
-                cfg_scale,
-                temperature,
-                top_p,
-                cfg_filter_top_k,
-                speed_factor_slider,
-                chunk_size,
-                seed_input,
-            ],
-            outputs=[audio_output],
-            fn=run_inference,
-            cache_examples=False,
-            label="Examples (Click to Run)",
-        )
-    else:
-        gr.Markdown("_(No examples configured or example prompt file missing)_")
+    # Note: Example section omitted as requested
 
 # --- Launch the App ---
 if __name__ == "__main__":

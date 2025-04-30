@@ -61,7 +61,7 @@ try:
             quantized_model = torch.quantization.quantize_dynamic(
                 model.model,
                 {torch.nn.Linear, torch.nn.LSTM},
-                dtype=torch.qint8
+                dtype=torch.quint8
             )
 
             # Step 3: Dereference the original
@@ -347,7 +347,7 @@ def run_inference(
                         use_torch_compile=True,
                         audio_prompt=prompt_path_for_generate,
                         audio_prompt_text=audio_prompt_text_input,
-                        use_offloading=True,  # Enable selective offloading for memory efficiency
+                        use_offloading=False,  # Enable selective offloading for memory efficiency
                     )
 
                 if generated_batch_audio is not None:

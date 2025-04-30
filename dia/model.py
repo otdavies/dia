@@ -1,5 +1,6 @@
 import time
 from enum import Enum
+from typing import Optional
 
 import dac
 import numpy as np
@@ -365,6 +366,7 @@ class Dia:
         cfg_filter_top_k: int = 35,
         audio_prompt: str | torch.Tensor | None = None,
         audio_prompt_path: str | None = None,
+        audio_prompt_text: Optional[str] = None,
         use_cfg_filter: bool | None = None,
         verbose: bool = False,
     ) -> np.ndarray:
@@ -378,13 +380,17 @@ class Dia:
         if audio_prompt_path:
             print("Warning: audio_prompt_path is deprecated. Use audio_prompt instead.")
             audio_prompt = audio_prompt_path
+        if audio_prompt_text:
+            full_text = f"{audio_prompt_text.strip()}\n{text.strip()}"
+        else:
+            full_text = text.strip()
         if use_cfg_filter is not None:
             print("Warning: use_cfg_filter is deprecated.")
 
         if verbose:
             total_start_time = time.time()
 
-        dec_state, dec_output = self._prepare_generation(text, audio_prompt, verbose)
+        dec_state, dec_output = self._prepare_generation(full_text, audio_prompt, verbose)
         dec_step = dec_output.prefill_step - 1
 
         bos_countdown = max_delay_pattern

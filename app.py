@@ -57,19 +57,14 @@ try:
                 device=device
             )
 
-            # Step 2: Apply dynamic quantization with expanded coverage
-            quantized_model = torch.quantization.quantize_dynamic(
-                model.model,
-                {torch.nn.Linear, torch.nn.LSTM},
-                dtype=torch.quint8
-            )
-
-            # Step 3: Dereference the original
-            model.model = None
-            torch.cuda.empty_cache()
-
-            # Step 4: Replace with quantized
-            model.model = quantized_model
+            # Step 2: Optimize Model
+            # model = optimize_dia_for_inference(
+            #     model,
+            #     optimize_attention=True,
+            #     optimize_decoder_mem=False,
+            #     apply_quantization=True,
+            #     apply_fusion=False,
+            # )
 
             if verbose:
                 print("Model loaded with optimized quantization")
